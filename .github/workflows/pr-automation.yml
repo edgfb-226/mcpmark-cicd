@@ -1,0 +1,267 @@
+name: Pull Request Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Run Prettier check
+        id: prettier
+        run: npx prettier --check .
+        continue-on-error: true
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        id: code-quality-comment
+        with:
+          script: |
+            const eslintOutput = `${{ steps.eslint.outputs.stdout || steps.eslint.outputs.stderr }}`;
+            const prettierOutput = `${{ steps.prettier.outputs.stdout || steps.prettier.outputs.stderr }}`;
+            
+            let commentBody = "## Code Quality Report\n\n";
+            
+            // Add ESLint results
+            commentBody += "### ESLint Results:\n";
+            commentBody += "```\n";
+            commentBody += eslintOutput || "No ESLint output available";
+            commentBody += "\n```\n\n";
+            
+            // Add Prettier results
+            commentBody += "### Prettier Results:\n";
+            commentBody += "```\n";
+            commentBody += prettierOutput || "No Prettier output available";
+            commentBody += "\n```\n";
+            
+            // Add status summary
+            const eslintFailed = ${{ steps.eslint.outcome == 'failure' }};
+            const prettierFailed = ${{ steps.prettier.outcome == 'failure' }};
+            commentBody += `Status: ${eslintFailed || prettierFailed ? "❌ Some checks failed" : "✅ All checks passed"}\n`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite with coverage
+        id: test
+        run: npm test -- --coverage
+        continue-on-error: true
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: warn
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        id: test-coverage-comment
+        with:
+          script: |
+            const testOutput = `${{ steps.test.outputs.stdout || steps.test.outputs.stderr }}`;
+            
+            // Extract coverage summary (adjust regex based on your coverage tool output)
+            const coverageMatch = testOutput.match(/Coverage summary.*?(\d+% statements, \d+% branches, \d+% functions, \d+% lines)/s);
+            const coverageSummary = coverageMatch ? coverageMatch[1] : "No coverage summary found";
+
+            let commentBody = "## Test Coverage Report\n\n";
+            commentBody += `### Coverage Summary: ${coverageSummary}\n\n`;
+            commentBody += "### Full Test Output:\n";
+            commentBody += "```\n";
+            commentBody += testOutput || "No test output available";
+            commentBody += "\n```\n";
+            
+            const testFailed = ${{ steps.test.outcome == 'failure' }};
+            commentBody += `Status: ${testFailed ? "❌ Tests failed" : "✅ Tests passed"}\n`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability scan (npm audit)
+        id: npm-audit
+        run: npm audit --json
+        continue-on-error: true
+
+      - name: Run secret scan (TruffleHog)
+        id: trufflehog
+        uses: trufflesecurity/trufflehog@v3
+        with:
+          path: .
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          output: json
+        continue-on-error: true
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        id: security-comment
+        with:
+          script: |
+            // Parse npm audit results
+            let auditResults = {};
+            try {
+              auditResults = JSON.parse(`${{ steps.npm-audit.outputs.stdout || '{}' }}`);
+            } catch (e) {
+              auditResults = { metadata: { vulnerabilities: {} } };
+            }
+            const vulnerabilities = auditResults.metadata?.vulnerabilities || { critical: 0, high: 0, moderate: 0, low: 0 };
+            
+            // Get TruffleHog results
+            const secretScanResults = `${{ steps.trufflehog.outputs.stdout || 'No secrets found' }}`;
+
+            let commentBody = "## Security Scan Report\n\n";
+            
+            // Add vulnerability summary
+            commentBody += "### Dependencies Vulnerabilities:\n";
+            commentBody += `- Critical: ${vulnerabilities.critical || 0}\n`;
+            commentBody += `- High: ${vulnerabilities.high || 0}\n`;
+            commentBody += `- Moderate: ${vulnerabilities.moderate || 0}\n`;
+            commentBody += `- Low: ${vulnerabilities.low || 0}\n\n`;
+            
+            // Add secret scan results
+            commentBody += "### Secrets Scan Results:\n";
+            commentBody += "```\n";
+            commentBody += secretScanResults;
+            commentBody += "\n```\n";
+            
+            // Add status summary
+            const auditFailed = ${{ steps.npm-audit.outcome == 'failure' }};
+            const secretsFound = secretScanResults !== 'No secrets found';
+            commentBody += `Status: ${auditFailed || secretsFound ? "❌ Issues detected" : "✅ No issues found"}\n`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: npm run build
+        continue-on-error: true
+
+      - name: Validate build artifacts
+        id: build-validation
+        run: |
+          if [ -d "dist/" ]; then
+            echo "✅ Build directory (dist/) exists"
+            echo "BUILD_VALIDATION_STATUS=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Build directory (dist/) not found"
+            echo "BUILD_VALIDATION_STATUS=failure" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/
+          if-no-files-found: warn
+
+      - name: Post Build Validation Report
+        uses: actions/github-script@v7
+        id: build-comment
+        with:
+          script: |
+            const buildOutput = `${{ steps.build.outputs.stdout || steps.build.outputs.stderr }}`;
+            const validationOutput = `${{ steps.build-validation.outputs.stdout || steps.build-validation.outputs.stderr }}`;
+            const validationStatus = `${{ steps.build-validation.outputs.BUILD_VALIDATION_STATUS }}`;
+
+            let commentBody = "## Build Validation\n\n";
+            commentBody += "### Build Output:\n";
+            commentBody += "```\n";
+            commentBody += buildOutput || "No build output available";
+            commentBody += "\n```\n\n";
+            
+            commentBody += "### Validation Results:\n";
+            commentBody += "```\n";
+            commentBody += validationOutput || "No validation output available";
+            commentBody += "\n```\n";
+            
+            commentBody += `Status: ${validationStatus === 'success' ? "✅ Build validation passed" : "❌ Build validation failed"}\n`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
